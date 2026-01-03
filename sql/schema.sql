@@ -141,7 +141,7 @@ CREATE TABLE BACKORDER (
 
 CREATE TABLE PARAGGELIA (
   order_id           INT AUTO_INCREMENT PRIMARY KEY,
-  katastasi          ENUM('ΕΚΚΡΕΜΕΙ','ΣΕ ΕΠΕΞΕΡΓΑΣΙΑ','ΑΠΕΣΤΑΛΕΙ','ΑΚΥΡΩΘΗΚΕ'),
+  katastasi          ENUM('ΕΚΚΡΕΜΕΙ','ΣΕ ΕΠΕΞΕΡΓΑΣΙΑ','ΑΠΕΣΤΑΛΗ','ΑΚΥΡΩΘΗΚΕ'),
   arxiko_kostos      DECIMAL(10,2),
   ekptosi            DECIMAL(10,2),
   afm_farmakeiou     VARCHAR(15),
@@ -236,6 +236,7 @@ CREATE TABLE PROMITHEYTIS_APOSTELEI_PROION_BACKORDER (
   supplier_id   INT,
   product_id    INT,
   backorder_id  INT,
+  quantity      INT,
   PRIMARY KEY (supplier_id, product_id, backorder_id),
   CONSTRAINT fk_papb_supplier
     FOREIGN KEY (supplier_id) REFERENCES PROMITHEYTIS(supplier_id)
