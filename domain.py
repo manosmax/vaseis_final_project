@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 ORDER_STATUS_TO_DB = {
     "Εκκρεμεί": "ΕΚΚΡΕΜΕΙ",
     "Σε επεξεργασία": "ΣΕ ΕΠΕΞΕΡΓΑΣΙΑ",
-    "Απεστάλη": "ΑΠΕΣΤΑΛΕΙ",
+    "Απεστάλη": "ΑΠΕΣΤΑΛΗ",
     "Ακυρώθηκε": "ΑΚΥΡΩΘΗΚΕ",
 }
 ORDER_STATUS_FROM_DB = {db: display for display, db in ORDER_STATUS_TO_DB.items()}

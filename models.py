@@ -27,7 +27,11 @@ from domain import (
     discount_percent_for_months,
     format_delivery_remaining,
 )
-from supplier_orders_store import SupplierOrderStore
+
+SHIPMENT_STATUS_LABELS = {
+    "ΟΛΟΚΛΗΡΩΜΕΝΗ": "Αποστολή ολοκληρώθηκε",
+    "ΜΕΡΙΚΗ": "Αποστολή μερική",
+}
 
 
 def _group_order_items(order_ids):
@@ -321,13 +325,24 @@ class PharmacyRepository:
 
         for order in orders:
             order["items"] = grouped.get(order["order_id"], [])
-            status = order.get("katastasi")
-            order["katastasi"] = ORDER_STATUS_FROM_DB.get(status, status)
+            base_status = order.get("katastasi")
+            shipment_status = order.get("shipment_status")
+            display_status = base_status
+            if base_status == ORDER_STATUS_TO_DB.get("Απεστάλη") and shipment_status:
+                display_status = shipment_status
+            if display_status in SHIPMENT_STATUS_LABELS:
+                order["katastasi"] = SHIPMENT_STATUS_LABELS[display_status]
+            else:
+                order["katastasi"] = ORDER_STATUS_FROM_DB.get(display_status, display_status)
         return orders
 
 
 class WarehouseRepository:
     """Λειτουργίες αποθήκης: παραγγελίες φαρμακείων, αποστολές και προμήθειες."""
+
+    SUPPLIER_STORAGE_LABEL = "SUPPLIER_ORDERS_VIRTUAL"
+    AUTO_SUPPLIER_NAME = "AUTO_SUPPLIER"
+    AUTO_SUPPLIER_DEFAULT_PHONE = "2100000000"
 
     @staticmethod
     def fetch_pharmacy_orders(status_filter=None):
@@ -355,6 +370,8 @@ class WarehouseRepository:
     def update_order_status(order_id, new_status):
         """Ελέγχει αν η παραγγελία μπορεί να αλλάξει στάδιο ή χρειάζεται αποστολή."""
         normalized = ORDER_STATUS_TO_DB.get(new_status, new_status)
+        if isinstance(normalized, str):
+            normalized = normalized.upper()
         if normalized == ORDER_STATUS_TO_DB.get("Απεστάλη"):
             return WarehouseRepository.send_order(order_id)
         with Database.transaction(dictionary=True) as cur:
@@ -462,10 +479,8 @@ class WarehouseRepository:
             total_cost = max(0.0, total_cost_base * (1 - discount_percent / 100))
             # Δημιουργούμε αποστολή και περνάμε τις γραμμές της αποστολής.
             WarehouseRepository._create_shipment(cur, order_id, total_cost, shipment_status, shipped)
-            cur.execute(
-                SQL.UPDATE_ORDER_STATUS,
-                (ORDER_STATUS_TO_DB["Απεστάλη"], order_id),
-            )
+            shipped_status = ORDER_STATUS_TO_DB.get("Απεστάλη", "ΑΠΕΣΤΑΛΕΙ")
+            cur.execute(SQL.UPDATE_ORDER_STATUS, (shipped_status, order_id))
         return True, "Η παραγγελία αποστάλθηκε."
 
     @staticmethod
@@ -475,7 +490,7 @@ class WarehouseRepository:
 
     @staticmethod
     def create_supplier_order(items):
-        """Αποθηκεύει παραγγελία προς προμηθευτές στο JSON store."""
+        """Αποθηκεύει παραγγελία προς προμηθευτές στο BACKORDER ώστε να υπάρχει μόνο στη MySQL."""
         if not items:
             return False, "Δεν προστέθηκαν προϊόντα."
 
@@ -499,50 +514,76 @@ class WarehouseRepository:
         if not prepared:
             return False, "Δεν προστέθηκαν προϊόντα."
 
-        total_cost = sum(item["quantity"] * item["unit_price"] for item in prepared)
-        order_id = SupplierOrderStore.create_order(prepared, total_cost)
-        return True, order_id
+        try:
+            with Database.transaction(dictionary=True) as cur:
+                supplier_storage_id = WarehouseRepository._ensure_supplier_storage(cur)
+                cur.execute(
+                    SQL.INSERT_BACKORDER,
+                    (supplier_storage_id, 0, datetime.utcnow().date()),
+                )
+                backorder_id = cur.lastrowid
+                for item in prepared:
+                    supplier_id = WarehouseRepository._create_auto_supplier(cur)
+                    cur.execute(
+                        SQL.INSERT_SUPPLIER_BACKORDER_ITEM,
+                        (supplier_id, item["product_id"], backorder_id, item["quantity"]),
+                    )
+            return True, backorder_id
+        except mysql.connector.Error as exc:
+            return False, f"Σφάλμα βάσης: {exc.msg}"
 
     @staticmethod
     def fetch_supplier_orders(status_filter=None):
-        """Φορτώνει παραγγελίες προμηθευτών και συμπληρώνει ανθρώπινα ονόματα."""
-        orders = SupplierOrderStore.list_orders(status_filter)
-        if not orders:
+        """Φορτώνει παραγγελίες προμηθευτών από τα BACKORDER entries με ειδική storage_id."""
+        storage_id = WarehouseRepository._get_supplier_storage_id()
+        if not storage_id:
+            return []
+        rows = Database.fetch_all(SQL.SUPPLIER_BACKORDERS, (storage_id,))
+        if not rows:
             return []
 
-        product_ids = set()
-        for order in orders:
-            for item in order.get("items", []):
-                # Χρησιμοποιούμε set ώστε κάθε product_id να ζητηθεί μία φορά από τη βάση.
-                product_ids.add(item.get("product_id"))
+        normalized = (status_filter or "Όλες").strip()
+        status_lookup = {"Σε εξέλιξη": 0, "Ολοκληρώθηκε": 1}
+        target = status_lookup.get(normalized)
+        filtered = [row for row in rows if target is None or row["oloklirothike"] == target]
+        if not filtered:
+            return []
 
-        name_map = {}
-        if product_ids:
-            product_list = list(product_ids)
-            query = with_in_clause(SQL.PRODUCT_NAMES_BY_IDS, product_list)
-            rows = Database.fetch_all(query, product_list)
-            name_map = {row["product_id"]: row["onoma"] for row in rows}
+        order_ids = [row["backorder_id"] for row in filtered]
+        items_map = WarehouseRepository._fetch_supplier_items(order_ids)
 
-        for order in orders:
-            created = order.get("created_at")
-            if created:
-                try:
-                    order["created_at"] = datetime.fromisoformat(created)
-                except ValueError:
-                    order["created_at"] = None
-            for item in order.get("items", []):
-                item["onoma"] = name_map.get(item["product_id"], f"#{item.get('product_id')}")
+        orders = []
+        for row in filtered:
+            order_items = items_map.get(row["backorder_id"], [])
+            total_cost = sum(item["quantity"] * item["unit_price"] for item in order_items)
+            created_at = row.get("hm_apostolis")
+            if created_at and not isinstance(created_at, datetime):
+                created_at = datetime.combine(created_at, datetime.min.time())
+            orders.append(
+                {
+                    "supplier_order_id": row["backorder_id"],
+                    "created_at": created_at,
+                    "total_cost": total_cost,
+                    "status": "Ολοκληρώθηκε" if row["oloklirothike"] else "Σε εξέλιξη",
+                    "items": order_items,
+                }
+            )
         return orders
 
     @staticmethod
     def mark_supplier_order_complete(order_id):
         """Μόλις παραδοθεί παραγγελία προμηθευτή, ενημερώνει θέσεις και καταγράφει backorders."""
-        order = SupplierOrderStore.get_order(order_id)
-        if not order:
+        storage_id = WarehouseRepository._get_supplier_storage_id()
+        if not storage_id:
+            return False, "Δεν υπάρχει καταχωρημένη παραγγελία."
+        order_row = Database.fetch_one(SQL.SUPPLIER_BACKORDER_BY_ID, (order_id,))
+        if not order_row or order_row.get("storage_id") != storage_id:
             return False, "Η παραγγελία δεν υπάρχει."
-        if order.get("status") == "Ολοκληρώθηκε":
+        if order_row.get("oloklirothike"):
             return False, "Η παραγγελία έχει ήδη ολοκληρωθεί."
-        items = order.get("items") or []
+
+        items_map = WarehouseRepository._fetch_supplier_items([order_id])
+        items = items_map.get(order_id) or []
         if not items:
             return False, "Δεν βρέθηκαν προϊόντα για την παραγγελία."
 
@@ -560,8 +601,11 @@ class WarehouseRepository:
             for storage_id in storage_ids:
                 # Από τη στιγμή που γεμίσαμε μια θέση, ενημερώνουμε τα backorders.
                 WarehouseRepository._record_backorder(cur, storage_id, executed_at)
+            cur.execute(
+                SQL.UPDATE_BACKORDER_STATUS,
+                (1, executed_at.date(), order_id),
+            )
 
-        SupplierOrderStore.update_status(order_id, "Ολοκληρώθηκε")
         return True, "Η παραγγελία ολοκληρώθηκε."
 
     @staticmethod
@@ -592,9 +636,10 @@ class WarehouseRepository:
     @staticmethod
     def _create_shipment(cur, order_id, total_cost, shipment_status, items):
         """Καταγράφει νέα αποστολή και τις αντίστοιχες γραμμές σε μια συναλλαγή."""
+        status_db = shipment_status.upper() if isinstance(shipment_status, str) else shipment_status
         cur.execute(
             SQL.INSERT_SHIPMENT,
-            (random.randint(100, 999), shipment_status, datetime.now(), total_cost, order_id),
+            (random.randint(100, 999), status_db, datetime.now(), total_cost, order_id),
         )
         shipment_id = cur.lastrowid
         item_rows = [
@@ -602,6 +647,48 @@ class WarehouseRepository:
         ]
         cur.executemany(SQL.INSERT_SHIPMENT_ITEM, item_rows)
         return shipment_id
+
+    @staticmethod
+    def _get_supplier_storage_id():
+        row = Database.fetch_one(SQL.SUPPLIER_STORAGE_BY_LABEL, (WarehouseRepository.SUPPLIER_STORAGE_LABEL,))
+        return row["storage_id"] if row else None
+
+    @staticmethod
+    def _ensure_supplier_storage(cur):
+        cur.execute(SQL.SUPPLIER_STORAGE_BY_LABEL, (WarehouseRepository.SUPPLIER_STORAGE_LABEL,))
+        row = cur.fetchone()
+        if row:
+            return row["storage_id"]
+        cur.execute(SQL.NEXT_STORAGE_ID)
+        storage_id = cur.fetchone()["next_id"]
+        cur.execute(SQL.INSERT_STORAGE, (storage_id, WarehouseRepository.SUPPLIER_STORAGE_LABEL))
+        return storage_id
+
+    @staticmethod
+    def _create_auto_supplier(cur):
+        """Δημιουργεί εγγραφή προμηθευτή placeholder με προκαθορισμένο τηλέφωνο."""
+        cur.execute(SQL.INSERT_SUPPLIER, (WarehouseRepository.AUTO_SUPPLIER_NAME, WarehouseRepository.AUTO_SUPPLIER_DEFAULT_PHONE))
+        return cur.lastrowid
+
+    @staticmethod
+    def _fetch_supplier_items(order_ids):
+        """Φέρνει τα προϊόντα των προμηθευτικών παραγγελιών από τις γέφυρες backorder/supplier."""
+        if not order_ids:
+            return {}
+        query = with_in_clause(SQL.SUPPLIER_BACKORDER_ITEMS, order_ids)
+        rows = Database.fetch_all(query, order_ids)
+        grouped = defaultdict(list)
+        for row in rows:
+            quantity = max(1, int(row.get("quantity") or 0))
+            grouped[row["backorder_id"]].append(
+                {
+                    "product_id": row["product_id"],
+                    "onoma": row["onoma"],
+                    "quantity": quantity,
+                    "unit_price": float(row["arx_kostos_temaxiou"]),
+                }
+            )
+        return grouped
 
     @staticmethod
     def _assign_product_to_position(cur, product_id, quantity):

@@ -262,13 +262,22 @@ class SQL:
                p.hm_ora_ektelesis AS executed_at,
                p.katastasi,
                p.arxiko_kostos,
-               ship.hm_ora_apostolis AS shipment_at
+               ship.hm_ora_apostolis AS shipment_at,
+               ship.katastasi AS shipment_status
         FROM PARAGGELIA p
         JOIN FARMAKEIO f ON f.afm = p.afm_farmakeiou
         LEFT JOIN (
-            SELECT order_id, MAX(hm_ora_apostolis) AS hm_ora_apostolis
-            FROM APOSTOLI
-            GROUP BY order_id
+            SELECT latest.order_id,
+                   a.hm_ora_apostolis,
+                   a.katastasi
+            FROM APOSTOLI a
+            JOIN (
+                SELECT order_id, MAX(hm_ora_apostolis) AS hm_ora_apostolis
+                FROM APOSTOLI
+                GROUP BY order_id
+            ) latest
+              ON latest.order_id = a.order_id
+             AND latest.hm_ora_apostolis = a.hm_ora_apostolis
         ) ship ON ship.order_id = p.order_id
         WHERE f.username = %s
         ORDER BY p.hm_ora_ektelesis DESC
@@ -279,13 +288,22 @@ class SQL:
                p.hm_ora_ektelesis AS executed_at,
                p.katastasi,
                p.arxiko_kostos,
-               ship.hm_ora_apostolis AS shipment_at
+               ship.hm_ora_apostolis AS shipment_at,
+               ship.katastasi AS shipment_status
         FROM PARAGGELIA p
         JOIN FARMAKEIO f ON f.afm = p.afm_farmakeiou
         LEFT JOIN (
-            SELECT order_id, MAX(hm_ora_apostolis) AS hm_ora_apostolis
-            FROM APOSTOLI
-            GROUP BY order_id
+            SELECT latest.order_id,
+                   a.hm_ora_apostolis,
+                   a.katastasi
+            FROM APOSTOLI a
+            JOIN (
+                SELECT order_id, MAX(hm_ora_apostolis) AS hm_ora_apostolis
+                FROM APOSTOLI
+                GROUP BY order_id
+            ) latest
+              ON latest.order_id = a.order_id
+             AND latest.hm_ora_apostolis = a.hm_ora_apostolis
         ) ship ON ship.order_id = p.order_id
         WHERE f.username = %s AND p.katastasi = %s
         ORDER BY p.hm_ora_ektelesis DESC
@@ -423,6 +441,7 @@ class SQL:
          AND p.ar_diadromou = t.ar_diadromou
          AND p.ar_rafiou = t.ar_rafiou
         WHERE p.product_id IS NULL
+        LIMIT 1
     """
     # INSERT_BACKORDER: αρχεία στο ιστορικό backorders πότε εξυπηρετήθηκε μια αποθήκη (oloklirothike flag).
     INSERT_BACKORDER = "INSERT INTO BACKORDER (storage_id, oloklirothike, hm_apostolis) VALUES (%s,%s,%s)"
@@ -439,3 +458,36 @@ class SQL:
         INSERT INTO APOSTOLI_PERIEXEI_PROION (shipment_id, product_id, temaxia_apostolis)
         VALUES (%s,%s,%s)
     """
+
+    # --- Καταγραφή παραγγελιών προμηθευτών μέσα από τα BACKORDER ---
+    SUPPLIER_STORAGE_BY_LABEL = "SELECT storage_id FROM APOTHIKI WHERE topothesia = %s LIMIT 1"
+    INSERT_SUPPLIER = "INSERT INTO PROMITHEYTIS (onoma, tilefono) VALUES (%s,%s)"
+    INSERT_SUPPLIER_BACKORDER_ITEM = """
+        INSERT INTO PROMITHEYTIS_APOSTELEI_PROION_BACKORDER (supplier_id, product_id, backorder_id, quantity)
+        VALUES (%s,%s,%s,%s)
+    """
+    SUPPLIER_BACKORDERS = """
+        SELECT backorder_id, storage_id, hm_apostolis, oloklirothike
+        FROM BACKORDER
+        WHERE storage_id = %s
+        ORDER BY backorder_id DESC
+    """
+    SUPPLIER_BACKORDER_BY_ID = """
+        SELECT backorder_id, storage_id, hm_apostolis, oloklirothike
+        FROM BACKORDER
+        WHERE backorder_id = %s
+    """
+    SUPPLIER_BACKORDER_ITEMS = """
+        SELECT papb.backorder_id,
+               papb.product_id,
+               pr.onoma,
+               pr.arx_kostos_temaxiou,
+               sup.supplier_id,
+               sup.tilefono,
+               papb.quantity
+        FROM PROMITHEYTIS_APOSTELEI_PROION_BACKORDER papb
+        JOIN PROION pr ON pr.product_id = papb.product_id
+        JOIN PROMITHEYTIS sup ON sup.supplier_id = papb.supplier_id
+        WHERE papb.backorder_id IN ({placeholders})
+    """
+    UPDATE_BACKORDER_STATUS = "UPDATE BACKORDER SET oloklirothike = %s, hm_apostolis = %s WHERE backorder_id = %s"
